@@ -6,5 +6,4 @@
 """Submodule defining the environment definitions."""
 
 from .vec_env import VecEnv
-
-__all__ = ["VecEnv"]
+from .vec_env_with_reset import VecEnvWithStateReset

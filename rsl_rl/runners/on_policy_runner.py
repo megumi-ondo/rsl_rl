@@ -16,8 +16,7 @@ from tensordict import TensorDict
 import rsl_rl
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config
-from rsl_rl.utils import resolve_obs_groups, store_code_state
+from rsl_rl.env import VecEnvWithStateReset
 
 
 class OnPolicyRunner:
@@ -28,30 +27,34 @@ class OnPolicyRunner:
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
         self.device = device
-        self.env = env
-
-        # Check if multi-GPU is enabled
-        self._configure_multi_gpu()
-
-        # Store training configuration
+        
+        # self.env = env
+        self.env = VecEnvWithStateReset(env, device=device)
+        
+        if self.env.num_privileged_obs is not None:
+            num_critic_obs = self.env.num_privileged_obs 
+        else:
+            num_critic_obs = self.env.num_obs
+        
+        # if self.env.num_privileged_obs is not None:
+        #    num_critic_obs = self.env.num_privileged_obs 
+        # else:
+        #    num_critic_obs = self.env.num_obs
+        
+        actor_critic_class = eval(self.cfg["policy_class_name"]) # ActorCritic
+        actor_critic: ActorCritic = actor_critic_class( self.env.num_obs,
+                                                        num_critic_obs,
+                                                        self.env.num_actions,
+                                                        **self.policy_cfg).to(self.device)
+        alg_class = eval(self.cfg["algorithm_class_name"]) # PPO
+        self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
+        
+        self.use_memory_reset = self.cfg.get("use_memory_reset", True)
+        self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, [self.env.num_obs], [self.env.num_privileged_obs], [self.env.num_actions])
 
-        # Query observations from environment for algorithm construction
-        obs = self.env.get_observations()
-        default_sets = ["critic"]
-        if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
-            default_sets.append("rnd_state")
-        self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], default_sets)
-
-        # Create the algorithm
-        self.alg = self._construct_algorithm(obs)
-
-        # Decide whether to disable logging
-        # Note: We only log from the process with rank 0 (main process)
-        self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
-
-        # Logging
+        # Log
         self.log_dir = log_dir
         self.writer = None
         self.tot_timesteps = 0
@@ -99,18 +102,15 @@ class OnPolicyRunner:
             start = time.time()
             # Rollout
             with torch.inference_mode():
-                for _ in range(self.num_steps_per_env):
-                    # Sample actions
-                    actions = self.alg.act(obs)
-                    # Step the environment
-                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                    # Move to device
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    # Process the step
-                    self.alg.process_env_step(obs, rewards, dones, extras)
-                    # Extract intrinsic rewards (only for logging)
-                    intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
-                    # Book keeping
+                for i in range(self.num_steps_per_env):
+                    actions = self.alg.act(obs, critic_obs)
+                    obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
+                    critic_obs = privileged_obs if privileged_obs is not None else obs
+                    obs, critic_obs, rewards, dones = obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
+                    self.alg.process_env_step(rewards, dones, infos)
+                    
+                    self.env.add_current_states_to_memory()
+                    
                     if self.log_dir is not None:
                         if "episode" in extras:
                             ep_infos.append(extras["episode"])
@@ -131,11 +131,27 @@ class OnPolicyRunner:
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
-                        if self.alg.rnd:
-                            erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                            irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                            cur_ereward_sum[new_ids] = 0
-                            cur_ireward_sum[new_ids] = 0
+                        
+                    if dones.any():
+                        done_indices = (dones > 0).nonzero(as_tuple=False).flatten()
+                        
+                        if self.use_memory_reset:
+                            # Memory reset
+                            reset_obs = self.env.reset_with_memory_sampling(done_indices)
+                        else:
+                            # Standard reset
+                            reset_obs = self.env.reset_idx(done_indices)
+                        
+                        # Get fresh observations after reset (safer approach)
+                        obs = self.env.get_observations().to(self.device)
+                        
+                        # Update privileged observations if they exist
+                        privileged_obs = self.env.get_privileged_observations()
+                        if privileged_obs is not None:
+                            privileged_obs = privileged_obs.to(self.device)
+                            critic_obs = privileged_obs
+                        else:
+                            critic_obs = obs
 
                 stop = time.time()
                 collection_time = stop - start
@@ -236,38 +252,37 @@ class OnPolicyRunner:
                     "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
                 )
 
-        str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
+        if self.use_memory_reset:
+            reset_stats = self.env.get_reset_statistics()
+            self.writer.add_scalar('Reset/memory_fraction', reset_stats['memory_frac'], locs['it'])
+            self.writer.add_scalar('Reset/mu_fraction', reset_stats['mu_frac'], locs['it'])
+            self.writer.add_scalar('Reset/memory_size', reset_stats['memory_size'], locs['it'])
 
-        if len(locs["rewbuffer"]) > 0:
-            log_string = (
-                f"""{"#" * width}\n"""
-                f"""{str.center(width, " ")}\n\n"""
-                f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {
-                    locs["learn_time"]:.3f}s)\n"""
-                f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
-            )
-            # Print losses
-            for key, value in locs["loss_dict"].items():
-                log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
-            # Print rewards
-            if hasattr(self.alg, "rnd") and self.alg.rnd:
-                log_string += (
-                    f"""{"Mean extrinsic reward:":>{pad}} {statistics.mean(locs["erewbuffer"]):.2f}\n"""
-                    f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(locs["irewbuffer"]):.2f}\n"""
-                )
-            log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(locs["rewbuffer"]):.2f}\n"""
-            # Print episode information
-            log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(locs["lenbuffer"]):.2f}\n"""
+        str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "
+
+        if len(locs['rewbuffer']) > 0:
+            log_string = (f"""{'#' * width}\n"""
+                          f"""{str.center(width, ' ')}\n\n"""
+                          f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
+                            'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
+                          f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
+                          f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+                          f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+                          f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
+                          f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n""")
+            
+            if self.use_memory_reset:
+                reset_stats = self.env.get_reset_statistics()
+                log_string += (f"""{'Memory reset fraction:':>{pad}} {reset_stats['memory_frac']:.2%}\n"""
+                              f"""{'Memory size:':>{pad}} {reset_stats['memory_size']}\n""")
         else:
-            log_string = (
-                f"""{"#" * width}\n"""
-                f"""{str.center(width, " ")}\n\n"""
-                f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {
-                    locs["learn_time"]:.3f}s)\n"""
-                f"""{"Mean action noise std:":>{pad}} {mean_std.item():.2f}\n"""
-            )
-            for key, value in locs["loss_dict"].items():
-                log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
+            log_string = (f"""{'#' * width}\n"""
+                          f"""{str.center(width, ' ')}\n\n"""
+                          f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
+                            'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
+                          f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
+                          f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+                          f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n""")
 
         log_string += ep_string
         log_string += (
