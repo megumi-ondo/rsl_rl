@@ -1,4 +1,4 @@
-# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
+# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -34,7 +34,7 @@ class EmpiricalNormalization(nn.Module):
 
     @property
     def mean(self) -> torch.Tensor:
-        return self._mean.squeeze(0).clone()
+        return self._mean.squeeze(0).clone()  # type: ignore
 
     @property
     def std(self) -> torch.Tensor:
@@ -92,8 +92,8 @@ class EmpiricalDiscountedVariationNormalization(nn.Module):
             self.emp_norm.update(avg)
 
         # Normalize rewards with the empirical std
-        if self.emp_norm._std > 0:
-            return rew / self.emp_norm._std
+        if self.emp_norm._std > 0:  # type: ignore
+            return rew / self.emp_norm._std  # type: ignore
         else:
             return rew
 

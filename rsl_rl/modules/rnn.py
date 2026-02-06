@@ -1,4 +1,4 @@
-# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
+# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -7,20 +7,21 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from typing import Union
 
 from rsl_rl.utils import unpad_trajectories
 
-HiddenState = torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None
+HiddenState = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor], None]  # Using Union due to Python <3.10
 """Type alias for the hidden state of RNNs (GRU/LSTM).
 
 For GRUs, this is a single tensor while for LSTMs, this is a tuple of two tensors (hidden state and cell state).
 """
 
 
-class Memory(nn.Module):
-    """Memory module for recurrent networks.
+class RNN(nn.Module):
+    """Network for recurrent architectures.
 
-    This module is used to store the hidden state of the policy. It currently supports GRU and LSTM.
+    This network is used to store the hidden state of the policy. It currently supports GRU and LSTM.
     """
 
     def __init__(self, input_size: int, hidden_dim: int = 256, num_layers: int = 1, type: str = "lstm") -> None:
@@ -39,7 +40,7 @@ class Memory(nn.Module):
         if batch_mode:
             # Batch mode needs saved hidden states
             if hidden_state is None:
-                raise ValueError("Hidden states not passed to memory module during policy update")
+                raise ValueError("Hidden states not passed to RNN module during policy update")
             out, _ = self.rnn(input, hidden_state)
             out = unpad_trajectories(out, masks)
         else:

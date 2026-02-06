@@ -1,4 +1,4 @@
-# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
+# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -22,4 +22,6 @@ def resolve_symmetry_config(alg_cfg: dict, env: VecEnv) -> dict:
     # Note: This is used by the symmetry function for handling different observation terms
     if "symmetry_cfg" in alg_cfg and alg_cfg["symmetry_cfg"] is not None:
         alg_cfg["symmetry_cfg"]["_env"] = env
+    else:
+        alg_cfg["symmetry_cfg"] = None
     return alg_cfg

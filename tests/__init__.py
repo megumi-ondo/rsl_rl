@@ -3,9 +3,4 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Learning algorithms."""
-
-from .distillation import Distillation
-from .ppo import PPO
-
-__all__ = ["PPO", "Distillation"]
+"""Tests for rsl_rl."""
